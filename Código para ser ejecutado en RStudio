@@ -1,0 +1,275 @@
+# =====================================================
+# 0. CONFIGURACIÓN DE RUTAS
+# =====================================================
+
+excel_path <- "Ingresar ruta de acceso a la base de datos en formato de Excel (.xlsx)"
+shp_path   <- "Ingresar ruta de acceso al archivo que contiene el polígono del AMSS en formato shapefile (.shp)"
+out_dir    <- "Ingresar ruta de acceso a la carpeta donde se guardarán los resultados"
+
+# resolución de la grilla en metros
+cellsize_m <- 25
+
+# nombres de salida
+out_tif     <- file.path(out_dir, "Nombre del raster resultante.tif")
+out_geojson <- file.path(out_dir, "Nombre del raster resultante.geojson")
+
+# CRS
+crs_wgs    <- 4326     # WGS84
+crs_metric <- 32616    # UTM 16N (El Salvador)
+
+
+# =====================================================
+# 1. LIBRERÍAS
+# =====================================================
+
+packs <- c("readxl","dplyr","sf","gstat","terra","sp")
+new <- setdiff(packs, rownames(installed.packages()))
+if (length(new)) install.packages(new, dependencies = TRUE)
+invisible(lapply(packs, library, character.only = TRUE))
+
+Sys.setenv(PROJ_NETWORK = "ON")  # para evitar problemas al transformar CRS
+
+
+# =====================================================
+# 2. FUNCIONES AUXILIARES
+# =====================================================
+
+# Winsorización simple para domar outliers
+winsorize <- function(v, lo = 0.01, hi = 0.99){
+  if (all(is.na(v))) return(v)
+  qs <- quantile(v, c(lo,hi), na.rm = TRUE)
+  pmin(pmax(v, qs[1]), qs[2])
+}
+
+
+# =====================================================
+# 3. LEER EXCEL Y PREPARAR DATOS
+# =====================================================
+
+raw <- readxl::read_excel(excel_path)
+
+# normalizar nombres
+names(raw) <- toupper(names(raw))
+names(raw) <- gsub("\\s+", " ", names(raw))
+
+# columnas que NECESITAMOS (tal como aparecen en tu Excel)
+need <- c("LAT_DD","LON_DD","PRECIO_POR_M2","ANO_DE_TRANSACCION")
+stopifnot(all(need %in% names(raw)))
+
+message("Usando columnas de coordenadas: LAT_DD / LON_DD")
+
+dat <- raw %>%
+  mutate(
+    lat       = as.numeric(LAT_DD),
+    lon       = as.numeric(LON_DD),
+    precio_m2 = as.numeric(PRECIO_POR_M2),
+    anio      = as.integer(ANO_DE_TRANSACCION)
+  ) %>%
+  filter(
+    !is.na(lat), !is.na(lon),
+    !is.na(precio_m2), precio_m2 > 0
+  ) %>%
+  mutate(
+    precio_m2_w = winsorize(precio_m2, 0.01, 0.99),
+    log_pm2     = log(precio_m2_w)
+  )
+
+message("Datos válidos: ", nrow(dat))
+
+if (nrow(dat) < 20) {
+  stop("Muy pocos puntos para hacer kriging (mínimo recomendado: 20).")
+}
+
+
+# =====================================================
+# 4. LEER SHAPE DEL AMSS Y PASAR TODO A CRS MÉTRICO
+# =====================================================
+
+amss <- sf::st_read(shp_path, quiet = TRUE)
+
+# reproyectar polígono a CRS métrico si está en grados
+amss_m <- if (sf::st_is_longlat(amss)) sf::st_transform(amss, crs_metric) else amss
+amss_m <- sf::st_make_valid(amss_m)
+
+# puntos en WGS84 y luego a UTM
+pts_wgs <- sf::st_as_sf(dat, coords = c("lon","lat"), crs = crs_wgs)
+pts_m   <- sf::st_transform(pts_wgs, crs_metric)
+
+
+# =====================================================
+# 5. FUNCIÓN PRINCIPAL: KRIGING / IDW
+# =====================================================
+
+krige_total <- function(pts_sf, amss_sf, tif_out, gj_out){
+  
+  sub <- pts_sf   # aquí usamos TODOS los puntos
+  
+  # --- eliminar duplicados exactos de coordenada ---
+  sub_coords <- sf::st_coordinates(sub)
+  dup_mask   <- duplicated(data.frame(x=sub_coords[,1], y=sub_coords[,2]))
+  if (any(dup_mask)) {
+    message("Eliminando ", sum(dup_mask), " duplicados exactos de coordenada.")
+    sub <- sub[!dup_mask,]
+  }
+  
+  sub_sp <- as(sub, "Spatial")
+  
+  # --- crear malla de predicción dentro del AMSS ---
+  v_amss   <- terra::vect(sf::st_make_valid(amss_sf))
+  ext_amss <- terra::ext(v_amss)
+  
+  r_base <- terra::rast(ext = ext_amss,
+                        crs = sf::st_crs(amss_sf)$wkt,
+                        resolution = cellsize_m)
+  
+  r_base <- terra::init(r_base, 1)                   # dar algún valor
+  rmask  <- terra::rasterize(v_amss, r_base, field=1) # 1 dentro, NA fuera
+  
+  grid_centers <- terra::as.points(rmask, values = FALSE, na.rm = TRUE)
+  grid_centers <- sf::st_as_sf(grid_centers)
+  grid_sp      <- as(grid_centers, "Spatial")
+  
+  # --- variograma empírico ---
+  coords <- sp::coordinates(sub_sp)
+  maxd   <- max(sp::spDists(coords))
+  cutoff <- 0.66 * maxd
+  width  <- cutoff / 15
+  
+  v.emp <- gstat::variogram(log_pm2 ~ 1,
+                            locations = sub_sp,
+                            cutoff = cutoff,
+                            width  = width)
+  
+  # --- ajuste de variograma (multi-start) ---
+  v_total <- stats::var(sub_sp$log_pm2, na.rm = TRUE)
+  best <- NULL
+  
+  if (!is.na(v_total) && v_total >= 1e-6) {
+    modelos <- c("Sph","Exp","Gau","Mat")
+    nuggets <- c(0, 0.05*v_total, 0.2*v_total)
+    psills  <- c(0.4*v_total, 0.7*v_total, 1.0*v_total)
+    ranges  <- c(0.15*maxd, 0.3*maxd, 0.5*maxd)
+    
+    fits <- list(); sse <- c()
+    
+    for (m in modelos) {
+      for (ng in nuggets) for (ps in psills) for (rg in ranges) {
+        vg0 <- try(gstat::vgm(psill = ps, model = m,
+                              range = rg, nugget = ng), silent = TRUE)
+        if (inherits(vg0, "try-error")) next
+        
+        fit <- try(gstat::fit.variogram(v.emp, vg0,
+                                        fit.sills  = TRUE,
+                                        fit.ranges = TRUE),
+                   silent = TRUE)
+        if (!inherits(fit, "try-error") &&
+            is.data.frame(fit) &&
+            all(c("model","psill","range") %in% names(fit))) {
+          
+          fits[[length(fits)+1]] <- fit
+          sse <- c(sse, attr(fit, "SSErr"))
+        }
+      }
+    }
+    
+    if (length(fits) > 0 && all(is.finite(sse))) {
+      best <- fits[[which.min(sse)]]
+    }
+  }
+  
+  # --- kriging si hay variograma; si no, IDW ---
+  if (is.data.frame(best) && nrow(best) >= 1 &&
+      all(c("model","psill","range") %in% names(best))) {
+    
+    nugget_val  <- if ("Nug" %in% best$model)
+      as.numeric(best$psill[best$model=="Nug"][1]) else 0
+    
+    idx_spatial <- which(best$model != "Nug")[1]
+    
+    if (is.na(idx_spatial)) {
+      metodo <- "idw"
+      message("Variograma sin componente espacial; usando IDW (p=2).")
+      g_idw <- gstat::gstat(formula = log_pm2 ~ 1,
+                            data = sub_sp,
+                            set = list(idp = 2))
+      pred  <- predict(g_idw, newdata = grid_sp)
+      if (is.null(pred$var1.var)) pred$var1.var <- NA_real_
+    } else {
+      model_name <- as.character(best$model[idx_spatial])
+      psill_val  <- as.numeric(best$psill[idx_spatial])
+      range_val  <- as.numeric(best$range[idx_spatial])
+      
+      message("Variograma elegido (", model_name, "): ",
+              "nugget=", round(nugget_val,3),
+              " psill=", round(psill_val,3),
+              " range=", round(range_val,1))
+      
+      g <- gstat::gstat(formula = log_pm2 ~ 1,
+                        data    = sub_sp,
+                        model   = best)
+      pred   <- predict(g, newdata = grid_sp)
+      metodo <- "kriging"
+    }
+  } else {
+    message("No hubo variograma convergente; usando IDW (p=2).")
+    g_idw <- gstat::gstat(formula = log_pm2 ~ 1,
+                          data = sub_sp,
+                          set  = list(idp = 2))
+    pred  <- predict(g_idw, newdata = grid_sp)
+    if (is.null(pred$var1.var)) pred$var1.var <- NA_real_
+    metodo <- "idw"
+  }
+  
+  # --- pasar a data.frame y volver a precios/m² ---
+  pred_df       <- as.data.frame(pred)
+  pred_df$pm2   <- exp(pred_df$var1.pred)
+  
+  # --- GEOJSON de puntos ---
+  pred_pts <- sf::st_as_sf(pred_df,
+                           coords = c("coords.x1","coords.x2"),
+                           crs    = sf::st_crs(amss_sf))
+  
+  pred_pts <- sf::st_intersection(pred_pts, amss_sf)
+  
+  sf::st_write(pred_pts[, c("pm2","var1.var")],
+               gj_out, delete_dsn = TRUE, quiet = TRUE)
+  message("GeoJSON exportado: ", gj_out,
+          " (", nrow(pred_pts), " puntos)")
+  
+  # --- GeoTIFF continuo ---
+  r_pred <- terra::rast(terra::ext(terra::vect(amss_sf)),
+                        crs = sf::st_crs(amss_sf)$wkt,
+                        resolution = cellsize_m)
+  r_pred <- terra::init(r_pred, NA)
+  
+  cells <- terra::cellFromXY(r_pred, sf::st_coordinates(pred_pts))
+  r_pred[cells] <- pred_pts$pm2
+  
+  r_pred <- terra::mask(r_pred, terra::vect(amss_sf))
+  terra::writeRaster(r_pred, tif_out, overwrite = TRUE)
+  
+  message("GeoTIFF exportado: ", tif_out)
+  
+  # --- validación cruzada (si fue kriging) ---
+  if (exists("metodo") && metodo == "kriging" && is.data.frame(best)) {
+    cv <- gstat::krige.cv(log_pm2 ~ 1, sub_sp,
+                          model = best, nfold = nrow(sub_sp))
+    rmse <- sqrt(mean((cv$observed - cv$var1.pred)^2, na.rm = TRUE))
+    me   <- mean(cv$observed - cv$var1.pred,  na.rm = TRUE)
+    message("CV total (kriging) → RMSE(log pm2) = ",
+            round(rmse,3),
+            " | Bias = ", round(me,3),
+            " | puntos = ", nrow(sub_sp))
+  } else {
+    message("CV total (IDW): no disponible.")
+  }
+}
+
+
+# =====================================================
+# 6. EJECUTAR
+# =====================================================
+
+krige_total(pts_m, amss_m, out_tif, out_geojson)
+
+message("Listo. Abre el GeoTIFF en QGIS.")
