@@ -122,8 +122,8 @@ krige_total <- function(pts_sf, amss_sf, tif_out, gj_out){
                         crs = sf::st_crs(amss_sf)$wkt,
                         resolution = cellsize_m)
   
-  r_base <- terra::init(r_base, 1)                   # dar algún valor
-  rmask  <- terra::rasterize(v_amss, r_base, field=1) # 1 dentro, NA fuera
+  r_base <- terra::init(r_base, 1)                   
+  rmask  <- terra::rasterize(v_amss, r_base, field=1) 
   
   grid_centers <- terra::as.points(rmask, values = FALSE, na.rm = TRUE)
   grid_centers <- sf::st_as_sf(grid_centers)
@@ -177,7 +177,7 @@ krige_total <- function(pts_sf, amss_sf, tif_out, gj_out){
     }
   }
   
-  # --- kriging si hay variograma; si no, IDW ---
+  # --- Kriging si hay variograma; si no, IDW ---
   if (is.data.frame(best) && nrow(best) >= 1 &&
       all(c("model","psill","range") %in% names(best))) {
     
@@ -250,7 +250,7 @@ krige_total <- function(pts_sf, amss_sf, tif_out, gj_out){
   
   message("GeoTIFF exportado: ", tif_out)
   
-  # --- validación cruzada (si fue kriging) ---
+  # --- validación cruzada (si fue Kriging) ---
   if (exists("metodo") && metodo == "kriging" && is.data.frame(best)) {
     cv <- gstat::krige.cv(log_pm2 ~ 1, sub_sp,
                           model = best, nfold = nrow(sub_sp))
