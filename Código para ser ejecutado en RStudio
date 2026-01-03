@@ -76,8 +76,8 @@ dat <- raw %>%
 
 message("Datos válidos: ", nrow(dat))
 
-if (nrow(dat) < 20) {
-  stop("Muy pocos puntos para hacer kriging (mínimo recomendado: 20).")
+if (nrow(dat) < 100) {
+  stop("Muy pocos puntos para hacer kriging (mínimo recomendado: 100).")
 }
 
 
@@ -273,3 +273,9 @@ krige_total <- function(pts_sf, amss_sf, tif_out, gj_out){
 krige_total(pts_m, amss_m, out_tif, out_geojson)
 
 message("Listo. Abre el GeoTIFF en QGIS.")
+
+
+
+
+
+
