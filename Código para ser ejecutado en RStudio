@@ -53,7 +53,7 @@ names(raw) <- toupper(names(raw))
 names(raw) <- gsub("\\s+", " ", names(raw))
 
 # columnas que NECESITAMOS (tal como aparecen en tu Excel)
-need <- c("LAT_DD","LON_DD","PRECIO_POR_M2","ANO_DE_TRANSACCION")
+need <- c("LAT_DD","LON_DD","PRECIO_POR_M2","AÑO_DE_TRANSACCION")
 stopifnot(all(need %in% names(raw)))
 
 message("Usando columnas de coordenadas: LAT_DD / LON_DD")
@@ -63,7 +63,7 @@ dat <- raw %>%
     lat       = as.numeric(LAT_DD),
     lon       = as.numeric(LON_DD),
     precio_m2 = as.numeric(PRECIO_POR_M2),
-    anio      = as.integer(ANO_DE_TRANSACCION)
+    anio      = as.integer(AÑO_DE_TRANSACCION)
   ) %>%
   filter(
     !is.na(lat), !is.na(lon),
